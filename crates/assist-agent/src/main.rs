@@ -53,7 +53,8 @@ use crate::capture::ScreenSource;
 use crate::input::Injector;
 
 const H264_PAYLOAD_TYPE: PayloadType = 102;
-const FRAME_INTERVAL: Duration = Duration::from_millis(66); // ~15 fps
+const TARGET_FPS: f32 = 20.0;
+const FRAME_INTERVAL: Duration = Duration::from_millis(50); // 20 fps
 
 #[derive(Parser, Debug)]
 #[command(about = "CyberDoc Assist agent (runs on the computer being helped)")]
@@ -406,8 +407,13 @@ async fn run_session(
     }
 
     // Start capture on its own thread and learn the monitor size for scaling.
-    let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(8);
-    let (width, height) = spawn_capture(15.0, 4000, frame_tx).context("starting screen capture")?;
+    // Small buffer: encoded H.264 frames must all be sent in order (dropping one
+    // corrupts the stream until the next keyframe), so instead of a deep queue we
+    // keep it shallow and let backpressure pace capture to the network — which
+    // keeps latency low rather than building a backlog of stale frames.
+    let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(2);
+    let (width, height) =
+        spawn_capture(TARGET_FPS, 4000, frame_tx).context("starting screen capture")?;
     let injector = Arc::new(Mutex::new(Injector::new(width, height)?));
 
     let (connected_tx, mut connected_rx) = channel::<()>(1);
