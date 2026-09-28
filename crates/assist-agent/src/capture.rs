@@ -62,3 +62,28 @@ impl ScreenSource {
         Ok((!data.is_empty()).then_some(data))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encodes a synthetic frame with no screen involved. This is the runtime
+    /// check that OpenH264's C++ (compiled from source, assembled with NASM)
+    /// actually built and works on this platform — `cargo test` in CI exercises
+    /// it, so a broken native toolchain fails loudly rather than at deploy time.
+    #[test]
+    fn openh264_encodes_a_synthetic_frame() {
+        let (w, h) = (320usize, 240usize);
+        let rgba = vec![0x80u8; w * h * 4]; // mid-grey RGBA
+        let config = EncoderConfig::new().usage_type(UsageType::ScreenContentRealTime);
+        let mut encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
+            .expect("encoder init");
+        let yuv = YUVBuffer::from_rgb_source(RgbaSliceU8::new(&rgba, (w, h)));
+        let bitstream = encoder.encode(&yuv).expect("encode");
+        // The first frame is a keyframe carrying SPS/PPS, so it is never empty.
+        assert!(
+            !bitstream.to_vec().is_empty(),
+            "expected a non-empty keyframe"
+        );
+    }
+}

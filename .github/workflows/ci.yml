@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Run every step under bash, on all three OSes, so the toolchain and native-tool
+# setup is written once. Third-party actions are avoided; actions/checkout is
+# first-party and pinned to a commit — this repo ships a security control, so its
+# supply chain stays small (same policy as sigilant).
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Debug info dominates a debug build; with the native stack it fills the runner
+  # disk. Line tables keep backtraces useful without the bulk.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # sigilant is a private git dependency; fetch it with git so the credential
+  # helper configured below applies (also set in .cargo/config.toml).
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # Server side: the broker + shared crates, which deploy to Linux. The agent is
+  # deliberately NOT built here — its screen-capture backend would pull in X11 /
+  # PipeWire dev libraries that never run in production. The agent is built and
+  # tested on its real targets (Windows, macOS) in the matrix job below.
+  server:
+    name: Broker + protocol (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # aws-lc-sys (via the sigilant crates) may assemble and generate bindings.
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
+
+      - name: Authenticate to the private sigilant dependency
+        # Requires a repo/org secret SIGILANT_CI_TOKEN: a PAT (or GitHub App
+        # token) with read access to cintelis/sigilant. The default GITHUB_TOKEN
+        # cannot read another private repo.
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.SIGILANT_CI_TOKEN }}@github.com/cintelis/sigilant".insteadOf \
+            "https://github.com/cintelis/sigilant"
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          version=$(sed -nE 's/^channel *= *"(.*)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$version" --profile minimal --component rustfmt,clippy
+
+      # Formatting is checked once, here — it does not compile anything.
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p assist-proto -p assist-broker --all-targets --locked -- -D warnings
+      - run: cargo test -p assist-proto -p assist-broker --locked
+      - run: cargo build -p assist-broker --locked
+
+      # Deployment check: the built broker actually boots, serves its key, issues
+      # a code, serves the viewer page, and keeps a verifiable audit chain.
+      - run: bash scripts/smoke-broker.sh
+
+  # The agent on its real targets. Building it here compiles OpenH264 from source
+  # (needs a C++ compiler + NASM) and the WebRTC stack, and exercises xcap/enigo's
+  # per-OS backends. `cargo test` runs the OpenH264 encode test, so a broken
+  # native toolchain fails in CI, not at deploy time.
+  agent:
+    name: Full stack (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # NASM: required by OpenH264's source build (and by aws-lc-sys on Windows).
+      # A C++ compiler is already present (MSVC on Windows, clang on macOS).
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> "$GITHUB_PATH"
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+
+      - name: Authenticate to the private sigilant dependency
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.SIGILANT_CI_TOKEN }}@github.com/cintelis/sigilant".insteadOf \
+            "https://github.com/cintelis/sigilant"
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          version=$(sed -nE 's/^channel *= *"(.*)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$version" --profile minimal --component rustfmt,clippy
+
+      - run: nasm --version
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Includes capture::tests::openh264_encodes_a_synthetic_frame — the runtime
+      # proof that the OpenH264 C++ built and encodes on this platform.
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
