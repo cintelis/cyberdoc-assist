@@ -42,6 +42,7 @@ use rtc::rtp_transceiver::rtp_sender::{
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::Track;
 use webrtc::media_stream::track_local::{TrackLocal, static_sample::TrackLocalStaticSample};
+use webrtc::rtp_transceiver::RtpSender;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
     RTCPeerConnectionState, Registry,
@@ -142,10 +143,16 @@ impl PeerConnectionEventHandler for Handler {
                         match control {
                             Control::RequestControl => {
                                 let granted = max_scope >= Scope::Control
-                                    && (auto_consent
-                                        || consent::ask(&format!(
+                                    && (auto_consent || {
+                                        // Read consent on a blocking thread so the stdin wait
+                                        // never stalls the async runtime or the data-channel loop.
+                                        let q = format!(
                                             "{technician} is asking to CONTROL your computer (move the mouse and type). Allow?"
-                                        )));
+                                        );
+                                        tokio::task::spawn_blocking(move || consent::ask(&q))
+                                            .await
+                                            .unwrap_or(false)
+                                    });
                                 if granted {
                                     injector.lock().await.set_allowed(true);
                                     let _ = dc.send_text(&reply(Control::ControlGranted)).await;
@@ -204,12 +211,30 @@ async fn register_session(http: &reqwest::Client, broker: &str) -> Result<NewSes
         .await?)
 }
 
+/// The local address ICE sockets should bind to: the primary outbound
+/// interface, found by asking the OS which local IP it would use to reach the
+/// internet (a connected UDP socket sends nothing; it just resolves the source
+/// IP the default route would pick). This is the real LAN adapter, so binding it
+/// avoids virtual adapters (Hyper-V/WSL/Docker) that `0.0.0.0` would also grab
+/// and that have no internet route. Falls back to `0.0.0.0` if detection fails.
+fn primary_udp_bind() -> String {
+    use std::net::UdpSocket;
+    let ip = UdpSocket::bind("0.0.0.0:0")
+        .and_then(|sock| {
+            sock.connect("8.8.8.8:80")?;
+            Ok(sock.local_addr()?.ip())
+        })
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    format!("{ip}:0")
+}
+
 /// Builds the answering peer connection, adds the screen track, and returns it
 /// with the track and the "connected" receiver.
 async fn build_peer_connection(
     runtime: Arc<dyn Runtime>,
     handler: Arc<Handler>,
-) -> Result<(Arc<dyn PeerConnection>, Arc<TrackLocalStaticSample>)> {
+) -> Result<(Arc<dyn PeerConnection>, Arc<TrackLocalStaticSample>, Arc<dyn RtpSender>)> {
     let video_codec = RTCRtpCodec {
         mime_type: MIME_TYPE_H264.to_owned(),
         clock_rate: 90000,
@@ -241,7 +266,11 @@ async fn build_peer_connection(
         .with_interceptor_registry(registry)
         .with_handler(handler)
         .with_runtime(runtime)
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
+        // Bind the primary outbound interface, not 0.0.0.0 — the latter also
+        // grabs virtual adapters (Hyper-V/WSL/Docker, e.g. 172.19.x) that have
+        // no internet route, so ICE gathers dead candidates and STUN packets
+        // fail with "unreachable network".
+        .with_udp_addrs(vec![primary_udp_bind()])
         .build()
         .await?;
 
@@ -263,10 +292,23 @@ async fn build_peer_connection(
             }],
         ),
     )?);
-    pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
-        .await?;
+    let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
 
-    Ok((Arc::new(pc) as Arc<dyn PeerConnection>, track))
+    Ok((Arc::new(pc) as Arc<dyn PeerConnection>, track, sender))
+}
+
+/// The payload type the peer actually negotiated for this sender's codec. The
+/// browser assigns its own payload type in the offer, so writing samples with
+/// our registered value would be rejected as an unsupported codec.
+async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>) -> Result<PayloadType> {
+    sender
+        .get_parameters()
+        .await?
+        .rtp_parameters
+        .codecs
+        .first()
+        .map(|codec| codec.payload_type)
+        .ok_or_else(|| anyhow!("sender has no negotiated codec"))
 }
 
 /// Starts a dedicated OS thread that owns the screen source and H.264 encoder
@@ -316,6 +358,7 @@ async fn stream_screen(
     track: Arc<TrackLocalStaticSample>,
     mut frames: mpsc::Receiver<Vec<u8>>,
     mut done: webrtc::runtime::Receiver<()>,
+    payload_type: PayloadType,
 ) -> Result<()> {
     let ssrc = *track
         .ssrcs()
@@ -329,7 +372,7 @@ async fn stream_screen(
             maybe = frames.recv() => match maybe {
                 Some(data) => {
                     track
-                        .sample_writer(ssrc, H264_PAYLOAD_TYPE)
+                        .sample_writer(ssrc, payload_type)
                         .write_sample(&Sample { data: data.into(), duration: FRAME_INTERVAL, ..Sample::new(Instant::now()) })
                         .await?;
                 }
@@ -377,7 +420,7 @@ async fn run_session(
         event_tx,
     });
 
-    let (pc, track) = build_peer_connection(runtime.clone(), handler).await?;
+    let (pc, track, sender) = build_peer_connection(runtime.clone(), handler).await?;
 
     pc.set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
         .await?;
@@ -395,8 +438,15 @@ async fn run_session(
     let track_for_stream = track.clone();
     runtime.spawn(Box::pin(async move {
         connected_rx.recv().await;
-        tracing::info!("peer connected — streaming screen");
-        if let Err(e) = stream_screen(track_for_stream, frame_rx, done_rx).await {
+        let payload_type = match negotiated_payload_type(&sender).await {
+            Ok(pt) => pt,
+            Err(e) => {
+                tracing::warn!("no negotiated video codec: {e}");
+                return;
+            }
+        };
+        tracing::info!("peer connected — streaming screen (payload type {payload_type})");
+        if let Err(e) = stream_screen(track_for_stream, frame_rx, done_rx, payload_type).await {
             tracing::warn!("screen stream ended: {e}");
         }
     }));
@@ -408,7 +458,13 @@ async fn run_session(
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            // Quiet the chatty ICE/mDNS/transport targets so consent prompts and
+            // real errors stay visible. Override with RUST_LOG when debugging.
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,rtc_ice::agent::agent_proto=off,webrtc::peer_connection::handler=off,\
+                 rtc_sctp=off,rtc_dtls=off"
+                    .into()
+            }),
         )
         .init();
     let args = Args::parse();
@@ -442,23 +498,43 @@ async fn main() -> Result<()> {
         .context("connecting to broker")?;
     let (mut sink, mut stream) = ws.split();
 
-    // Outbound signaling (answers, rejections, audit events) funnels through here.
+    // Outbound signaling (answers, rejections, audit events) funnels through here,
+    // plus a periodic WebSocket ping so the edge does not idle-close the
+    // signaling connection between sessions.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Signal>();
     let writer = tokio::spawn(async move {
-        while let Some(signal) = out_rx.recv().await {
-            let Ok(text) = serde_json::to_string(&signal) else {
-                continue;
-            };
-            if sink.send(WsMessage::Text(text.into())).await.is_err() {
-                break;
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(25));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                maybe = out_rx.recv() => match maybe {
+                    Some(signal) => {
+                        let Ok(text) = serde_json::to_string(&signal) else { continue };
+                        if sink.send(WsMessage::Text(text.into())).await.is_err() { break; }
+                    }
+                    None => break,
+                },
+                _ = keepalive.tick() => {
+                    if sink.send(WsMessage::Ping(Vec::new().into())).await.is_err() { break; }
+                }
             }
         }
     });
 
     let runtime = default_runtime().context("no webrtc runtime")?;
+    let mut session_active = false;
 
     while let Some(message) = stream.next().await {
-        let message = message.context("broker connection error")?;
+        let message = match message {
+            Ok(m) => m,
+            // The signaling link is only needed for setup and event relay; media
+            // and input are peer-to-peer, so a dropped signaling socket must not
+            // tear down an active session.
+            Err(e) => {
+                tracing::warn!("signaling connection dropped: {e}");
+                break;
+            }
+        };
         let WsMessage::Text(text) = message else {
             if matches!(message, WsMessage::Close(_)) {
                 break;
@@ -474,7 +550,10 @@ async fn main() -> Result<()> {
         };
         match signal {
             Signal::Offer { sdp, grant } => {
-                let token = grant.ok_or_else(|| anyhow!("offer arrived without a grant"))?;
+                let Some(token) = grant else {
+                    tracing::warn!("offer arrived without a grant; ignoring");
+                    continue;
+                };
                 let grant = match verify_grant(&token, &broker_key, &session.code, now()) {
                     Ok(g) => g,
                     Err(e) => {
@@ -495,6 +574,7 @@ async fn main() -> Result<()> {
                 .await
                 {
                     Ok(Some(answer_sdp)) => {
+                        session_active = true;
                         let _ = out_tx.send(Signal::Answer { sdp: answer_sdp });
                     }
                     Ok(None) => {
@@ -515,6 +595,13 @@ async fn main() -> Result<()> {
             }
             other => tracing::debug!("ignored signal: {other:?}"),
         }
+    }
+
+    // If a session is live, the peer-to-peer media/control keep running even
+    // though signaling ended; stay up until the operator stops the agent.
+    if session_active {
+        tracing::info!("signaling closed — the session continues peer-to-peer. Press Ctrl-C to exit.");
+        let _ = tokio::signal::ctrl_c().await;
     }
 
     writer.abort();

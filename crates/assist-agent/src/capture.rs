@@ -7,7 +7,7 @@
 //! frame interval the caller ticks at.
 
 use anyhow::{Context, Result};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType};
 use openh264::formats::{RgbaSliceU8, YUVBuffer};
 use xcap::Monitor;
 
@@ -32,7 +32,11 @@ impl ScreenSource {
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .max_frame_rate(FrameRate::from_hz(fps))
-            .bitrate(BitRate::from_bps(kbps * 1000));
+            .bitrate(BitRate::from_bps(kbps * 1000))
+            // Emit a keyframe about every 2s so a browser that joins (or briefly
+            // loses packets) can start decoding quickly instead of showing black
+            // until the next scene change.
+            .intra_frame_period(IntraFramePeriod::from_num_frames((fps.max(1.0) * 2.0) as u32));
         // `Encoder::new()` also works (source-built API); with_api_config lets
         // us pass the screen-content tuning above.
         let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
