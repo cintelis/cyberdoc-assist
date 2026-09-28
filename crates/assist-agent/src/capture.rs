@@ -58,7 +58,9 @@ impl ScreenSource {
             // Emit a keyframe about every 2s so a browser that joins (or briefly
             // loses packets) can start decoding quickly instead of showing black
             // until the next scene change.
-            .intra_frame_period(IntraFramePeriod::from_num_frames((fps.max(1.0) * 2.0) as u32));
+            .intra_frame_period(IntraFramePeriod::from_num_frames(
+                (fps.max(1.0) * 2.0) as u32,
+            ));
         // `Encoder::new()` also works (source-built API); with_api_config lets
         // us pass the screen-content tuning above.
         let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
@@ -86,7 +88,8 @@ impl ScreenSource {
         // Resize only when needed (or when the raw size is odd — H.264 needs even).
         let resized;
         let src = if (tw, th) != (cw, ch) {
-            resized = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
+            resized =
+                image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
             &resized
         } else {
             &image

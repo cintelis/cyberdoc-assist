@@ -42,11 +42,11 @@ use rtc::rtp_transceiver::rtp_sender::{
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::Track;
 use webrtc::media_stream::track_local::{TrackLocal, static_sample::TrackLocalStaticSample};
-use webrtc::rtp_transceiver::RtpSender;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
     RTCPeerConnectionState, Registry,
 };
+use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::{Runtime, Sender, channel, default_runtime};
 
 use crate::capture::ScreenSource;
@@ -234,7 +234,11 @@ fn primary_udp_bind() -> String {
 async fn build_peer_connection(
     runtime: Arc<dyn Runtime>,
     handler: Arc<Handler>,
-) -> Result<(Arc<dyn PeerConnection>, Arc<TrackLocalStaticSample>, Arc<dyn RtpSender>)> {
+) -> Result<(
+    Arc<dyn PeerConnection>,
+    Arc<TrackLocalStaticSample>,
+    Arc<dyn RtpSender>,
+)> {
     let video_codec = RTCRtpCodec {
         mime_type: MIME_TYPE_H264.to_owned(),
         clock_rate: 90000,
@@ -292,7 +296,9 @@ async fn build_peer_connection(
             }],
         ),
     )?);
-    let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
+    let sender = pc
+        .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
+        .await?;
 
     Ok((Arc::new(pc) as Arc<dyn PeerConnection>, track, sender))
 }
@@ -600,7 +606,9 @@ async fn main() -> Result<()> {
     // If a session is live, the peer-to-peer media/control keep running even
     // though signaling ended; stay up until the operator stops the agent.
     if session_active {
-        tracing::info!("signaling closed — the session continues peer-to-peer. Press Ctrl-C to exit.");
+        tracing::info!(
+            "signaling closed — the session continues peer-to-peer. Press Ctrl-C to exit."
+        );
         let _ = tokio::signal::ctrl_c().await;
     }
 
