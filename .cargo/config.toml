@@ -1,0 +1,12 @@
+# sigilant is a private repo: let cargo use git's own credential helper to fetch it.
+[net]
+git-fetch-with-cli = true
+
+# Windows development convenience only (mirrors sigilant's config).
+#
+# aws-lc-sys (pulled in transitively via the sigilant crates) needs the NASM
+# assembler on x86-64 Windows. Rather than require NASM, use the assembler output
+# AWS ships with the crate. No effect on Linux or macOS. Set to "0" to build with
+# your own NASM instead.
+[env]
+AWS_LC_SYS_PREBUILT_NASM = { value = "1", force = false }

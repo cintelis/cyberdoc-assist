@@ -1,0 +1,25 @@
+[package]
+name = "assist-broker"
+description = "Session broker: support codes, WebRTC signaling, signed grants and the hash-chained session audit log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+assist-proto = { workspace = true }
+sigilant-token = { workspace = true }
+sigilant-audit = { workspace = true }
+anyhow = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+clap = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

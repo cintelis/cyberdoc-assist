@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+assist-proto = { path = "crates/assist-proto" }
+
+# Control plane, reused from Sigilant: ML-DSA signing keys for session grants,
+# and the hash chain for the session audit log. Pinned to a commit so a change
+# in Sigilant is adopted deliberately.
+#
+# For local development against an unpushed Sigilant checkout, uncomment:
+# [patch."https://github.com/cintelis/sigilant"]
+# sigilant-token = { path = "../sigilant/crates/sigilant-token" }
+# sigilant-audit = { path = "../sigilant/crates/sigilant-audit" }
+sigilant-token = { git = "https://github.com/cintelis/sigilant", rev = "f25c6c10b27476fe43f37870c9fbf060fecde775" }
+sigilant-audit = { git = "https://github.com/cintelis/sigilant", rev = "f25c6c10b27476fe43f37870c9fbf060fecde775" }
+
+anyhow = "1"
+base64ct = { version = "1.8", features = ["alloc"] }
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+# Our own code needs no unsafe: the OS-facing work (capture, encode, input) is
+# done by crates that wrap it. Unlike Sigilant, the build graph *does* contain
+# classical crypto — WebRTC's DTLS-SRTP requires it — which is why this is a
+# separate workspace.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CyberDoc Assist</title>
+<style>
+  :root { --bg:#0b1220; --panel:#131c2e; --text:#e6ecf5; --muted:#8a97ad; --accent:#3aa0ff; --ok:#35c46a; --bad:#ff5a5f; --line:#2a3957; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; gap:12px; align-items:center; padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header strong { letter-spacing:.2px; }
+  .grow { flex:1; }
+  input { background:#0b1220; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:7px 10px; font:inherit; width:150px; }
+  button { background:var(--accent); color:#00121f; border:0; border-radius:6px; padding:8px 14px; font:inherit; font-weight:600; cursor:pointer; }
+  button.secondary { background:#22304c; color:var(--text); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #status { color:var(--muted); }
+  .pill { padding:3px 9px; border-radius:999px; font-size:12px; font-weight:600; }
+  .pill.view { background:#22304c; color:var(--text); }
+  .pill.control { background:var(--ok); color:#00160a; }
+  main { flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; background:#05080f; position:relative; }
+  video { max-width:100%; max-height:100%; background:#000; outline:none; }
+  #hint { position:absolute; color:var(--muted); pointer-events:none; text-align:center; padding:20px; }
+</style>
+</head>
+<body>
+<header>
+  <strong>CyberDoc&nbsp;Assist</strong>
+  <span id="statePill" class="pill view">Not connected</span>
+  <input id="code" placeholder="9-digit code" inputmode="numeric" maxlength="9">
+  <input id="tech" placeholder="Your name" value="">
+  <button id="connect">Connect</button>
+  <button id="requestControl" class="secondary" disabled>Request control</button>
+  <button id="end" class="secondary" disabled>End</button>
+  <span class="grow"></span>
+  <span id="status">Enter the code the client read to you.</span>
+</header>
+<main>
+  <div id="hint">The client's screen will appear here once you connect.</div>
+  <video id="screen" autoplay playsinline tabindex="0"></video>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const video = $("screen"), statusEl = $("status"), pill = $("statePill"), hint = $("hint");
+
+let ws = null, pc = null, control = null, controlling = false;
+
+function setStatus(text) { statusEl.textContent = text; }
+function setPill(text, cls) { pill.textContent = text; pill.className = "pill " + cls; }
+
+function reset() {
+  controlling = false;
+  if (control) { try { control.close(); } catch {} control = null; }
+  if (pc) { try { pc.close(); } catch {} pc = null; }
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+  video.srcObject = null;
+  hint.style.display = "";
+  $("connect").disabled = false;
+  $("requestControl").disabled = true;
+  $("end").disabled = true;
+  setPill("Not connected", "view");
+}
+
+$("connect").onclick = connect;
+$("end").onclick = () => { setStatus("Session ended."); reset(); };
+$("requestControl").onclick = () => {
+  if (control && control.readyState === "open") {
+    send(control, { type: "request_control" });
+    setStatus("Asking the client to allow control…");
+  }
+};
+
+function send(channel, obj) { channel.send(JSON.stringify(obj)); }
+function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+async function connect() {
+  const code = $("code").value.replace(/\D/g, "");
+  if (code.length !== 9) { setStatus("The code is 9 digits."); return; }
+  const tech = encodeURIComponent($("tech").value.trim() || "technician");
+  $("connect").disabled = true;
+  setStatus("Connecting…");
+
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws/viewer?code=${code}&technician=${tech}`);
+
+  ws.onmessage = (ev) => onSignal(JSON.parse(ev.data));
+  ws.onclose = () => { setStatus("Disconnected."); reset(); };
+  ws.onerror = () => setStatus("Could not connect. Check the code.");
+
+  ws.onopen = async () => {
+    pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    pc.addTransceiver("video", { direction: "recvonly" });
+    control = pc.createDataChannel("control", { ordered: true });
+    control.onopen = () => { $("requestControl").disabled = false; setStatus("Connected. You can view the screen."); };
+    control.onmessage = (e) => onControl(JSON.parse(e.data));
+
+    pc.ontrack = (e) => { video.srcObject = e.streams[0]; hint.style.display = "none"; };
+    pc.onconnectionstatechange = () => {
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) { setStatus("Connection lost."); reset(); }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await iceComplete(pc);            // non-trickle: send once gathering is done
+    wsSend({ type: "offer", sdp: pc.localDescription.sdp });
+    $("end").disabled = false;
+    setPill("Viewing", "view");
+    setStatus("Waiting for the client to accept…");
+  };
+}
+
+function iceComplete(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const check = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", check); resolve(); } };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function onSignal(msg) {
+  switch (msg.type) {
+    case "answer":
+      await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+      break;
+    case "rejected":
+      setStatus("Declined: " + msg.reason); reset(); break;
+    case "peer_left":
+      setStatus("The client ended the session."); reset(); break;
+  }
+}
+
+function onControl(msg) {
+  switch (msg.type) {
+    case "control_granted":
+      controlling = true; setPill("Controlling", "control");
+      setStatus("Control granted. Your mouse and keyboard now drive the client's screen.");
+      break;
+    case "control_denied":
+      controlling = false; setStatus("Control declined: " + (msg.reason || ""));
+      break;
+    case "control_revoked":
+      controlling = false; setPill("Viewing", "view"); setStatus("Control was withdrawn at the client's computer.");
+      break;
+  }
+}
+
+// ── Input capture (only forwarded while controlling) ───────────────────────────
+function norm(e) {
+  const r = video.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+}
+function inside(p) { return p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1; }
+function forward(obj) { if (controlling && control && control.readyState === "open") send(control, obj); }
+const BTN = { 0: "left", 1: "middle", 2: "right" };
+
+video.addEventListener("mousemove", (e) => { const p = norm(e); if (inside(p)) forward({ type: "mouse_move", x: p.x, y: p.y }); });
+video.addEventListener("mousedown", (e) => { const p = norm(e); if (inside(p)) { forward({ type: "mouse_button", button: BTN[e.button] || "left", down: true, x: p.x, y: p.y }); e.preventDefault(); } });
+video.addEventListener("mouseup",   (e) => { const p = norm(e); if (inside(p)) { forward({ type: "mouse_button", button: BTN[e.button] || "left", down: false, x: p.x, y: p.y }); e.preventDefault(); } });
+video.addEventListener("contextmenu", (e) => { if (controlling) e.preventDefault(); });
+video.addEventListener("wheel", (e) => { forward({ type: "wheel", dx: e.deltaX, dy: e.deltaY }); if (controlling) e.preventDefault(); }, { passive: false });
+video.addEventListener("keydown", (e) => { forward({ type: "key", key: e.key, down: true }); if (controlling) e.preventDefault(); });
+video.addEventListener("keyup",   (e) => { forward({ type: "key", key: e.key, down: false }); if (controlling) e.preventDefault(); });
+
+window.addEventListener("beforeunload", reset);
+</script>
+</body>
+</html>
