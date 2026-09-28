@@ -11,11 +11,33 @@ use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePe
 use openh264::formats::{RgbaSliceU8, YUVBuffer};
 use xcap::Monitor;
 
+/// Encode ceiling. Browsers negotiate H.264 level ~3.1 (about 720p); sending a
+/// full 1080p+ desktop at a higher level makes their decoder drop every frame
+/// (black video). Downscaling to fit keeps decoding reliable and cuts bandwidth.
+/// Control is unaffected: the mouse maps to the full monitor, not this size.
+const MAX_ENCODE_W: u32 = 1280;
+const MAX_ENCODE_H: u32 = 720;
+
 pub struct ScreenSource {
     monitor: Monitor,
     encoder: Encoder,
     width: u32,
     height: u32,
+}
+
+/// The largest even width/height that fits `(w, h)` within `(mw, mh)` keeping
+/// aspect ratio. H.264 needs even dimensions.
+fn fit_within(w: u32, h: u32, mw: u32, mh: u32) -> (u32, u32) {
+    let (nw, nh) = if w <= mw && h <= mh {
+        (w, h)
+    } else {
+        let scale = (mw as f64 / w as f64).min(mh as f64 / h as f64);
+        (
+            ((w as f64 * scale).round() as u32).max(2),
+            ((h as f64 * scale).round() as u32).max(2),
+        )
+    };
+    (nw & !1, nh & !1)
 }
 
 impl ScreenSource {
@@ -58,8 +80,20 @@ impl ScreenSource {
     /// Returns `Ok(None)` when the encoder emitted nothing this frame.
     pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
         let image = self.monitor.capture_image().context("capturing screen")?;
-        let (w, h) = (image.width() as usize, image.height() as usize);
-        let rgba = RgbaSliceU8::new(image.as_raw(), (w, h));
+        let (cw, ch) = (image.width(), image.height());
+        let (tw, th) = fit_within(cw, ch, MAX_ENCODE_W, MAX_ENCODE_H);
+
+        // Resize only when needed (or when the raw size is odd — H.264 needs even).
+        let resized;
+        let src = if (tw, th) != (cw, ch) {
+            resized = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
+            &resized
+        } else {
+            &image
+        };
+
+        let (w, h) = (src.width() as usize, src.height() as usize);
+        let rgba = RgbaSliceU8::new(src.as_raw(), (w, h));
         let yuv = YUVBuffer::from_rgb_source(rgba);
         let bitstream = self.encoder.encode(&yuv).context("encoding frame")?;
         let data = bitstream.to_vec();
