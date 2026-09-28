@@ -6,9 +6,10 @@ technician to install, a short-lived code the **client** reads out to start it,
 a visible "you are being viewed" state, and a tamper-evident log of everything
 that happened.
 
-This is the self-hosted / reference implementation. It reuses CyberDoc's
-sister project **Sigilant** for the parts Sigilant already does well:
-short-lived signed grants and a hash-chained audit trail.
+This is the self-hosted / reference implementation. It is **fully
+self-contained** — no dependency on any other CyberDoc platform: short-lived
+Ed25519-signed grants and a SHA-256 hash-chained audit trail, both implemented
+in this repo.
 
 > **Status: proof of concept.** The control plane (codes, signaling, signed
 > grants, audit) is built, builds clean, and is smoke-tested. The media/input
@@ -22,7 +23,7 @@ short-lived signed grants and a hash-chained audit trail.
  ┌─────────────────────┐            ┌──────────────────────┐         ┌──────────────────┐
  │ assist-agent (Rust)  │  register  │ /api/sessions → code │         │ browser: viewer  │
  │  screen capture ─────┼───────────►│ /ws/agent            │◄───ws───┤ /ws/viewer       │
- │  H.264 encode        │            │ signs a Grant (ML-DSA)│  offer  │ RTCPeerConnection│
+ │  H.264 encode        │            │ signs a Grant (Ed25519)│ offer  │ RTCPeerConnection│
  │  input injection ◄───┤            │ hash-chained audit   │────────►│ <video> + input  │
  └─────────┬───────────┘            └──────────────────────┘         └────────┬─────────┘
            │                                                                   │
@@ -48,29 +49,34 @@ short-lived signed grants and a hash-chained audit trail.
 
 ```
 crates/
-  assist-proto/    shared wire types; signed session Grant (built on sigilant-token)
+  assist-proto/    shared wire types; Ed25519-signed session Grant
   assist-broker/   session codes, WebRTC signaling relay, signed grants,
-                   hash-chained audit log (built on sigilant-audit)
+                   SHA-256 hash-chained audit log
   assist-agent/    runs on the client's computer: consent, screen capture,
                    H.264 encode, WebRTC, gated input injection
 web/
   viewer.html      the technician's page — plain browser WebRTC, no install
 ```
 
-### What comes from Sigilant
+### Crypto, self-contained
 
-`assist-proto` and `assist-broker` depend on `sigilant-token` and
-`sigilant-audit` as git dependencies (pinned by commit in the workspace
-`Cargo.toml`). Grants are ML-DSA-signed with the same key type Sigilant issues
-task tokens with; the session log is the same tamper-evident hash chain, so
-`sigilant audit verify` and the broker's `/api/audit` agree on whether it is
-intact. This is a **separate workspace** on purpose:
+No external CyberDoc platform is a dependency — this repo owns its trust
+primitives, using widely-used permissive crates:
 
-- it allows the classical crypto WebRTC's DTLS-SRTP requires, which Sigilant's
-  post-quantum-only build policy forbids; and
-- the OS-facing crates live here, away from Sigilant's dependency rules.
+- **Grants** are signed with **Ed25519** (`ed25519-dalek`): the broker holds the
+  signing key, serves its public key at `GET /api/key`, and the agent verifies
+  every grant against it, so a tampered signaling path cannot widen a
+  technician's scope. Grants are short-lived (default 1 hour). See
+  `crates/assist-proto/src/lib.rs`.
+- **The audit log** is a **SHA-256 hash chain** (`sha2`): each session event is
+  one link over the previous hash, so editing, removing or reordering any line
+  is detectable. `GET /api/audit` reports `verified: true/false`. See
+  `crates/assist-broker/src/audit.rs`.
 
-Both workspaces still `forbid(unsafe_code)` in their own code.
+The workspace `forbid(unsafe_code)`s its own code. Ed25519 is a classical
+signature — appropriate for short-lived internal grants; if a post-quantum
+posture is later wanted, the grant format is versioned (`cyberdoc.assist.grant.v1`)
+so the scheme can be rotated.
 
 ## Running it (local, one machine)
 
@@ -153,7 +159,8 @@ consent surface is the product:
   a technician name in the URL; take it from the `cyberdoc_session` cookie and
   set `max_scope` per plan / Cedar policy instead of one broker-wide flag.
 - **Anchor the audit head** (sign it, write it to object-locked storage) as
-  Sigilant's sync service does, so truncation of the tail is detectable too.
+  a signed head written to object-locked storage, so truncation of the tail is
+  detectable too.
 - **Session/agent expiry**, TURN relay for strict NATs (e.g. Cloudflare
   Realtime), reconnect, and multi-monitor selection.
 - **A native consent UI + banner** on the agent, replacing the terminal prompts.

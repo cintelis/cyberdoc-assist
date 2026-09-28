@@ -22,8 +22,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use assist_proto::{Control, Grant, NewSession, PublicKey, Scope, Signal, verify_grant};
 use clap::Parser;
+use ed25519_dalek::VerifyingKey;
 use futures_util::{SinkExt, StreamExt};
-use sigilant_token::VerifyingKey;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 

@@ -8,8 +8,8 @@ publish.workspace = true
 
 [dependencies]
 assist-proto = { workspace = true }
-sigilant-token = { workspace = true }
-sigilant-audit = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 anyhow = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
 clap = { workspace = true }

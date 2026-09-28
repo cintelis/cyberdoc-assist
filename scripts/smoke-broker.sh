@@ -33,8 +33,8 @@ for _ in $(seq 40); do
 done
 [ "$ready" = 1 ] || { echo "FAIL: broker did not start"; exit 1; }
 
-curl -fsS "$BASE/api/key" | grep -q '"alg":"ML-DSA-65"' \
-  || { echo "FAIL: signing key not served as ML-DSA-65"; exit 1; }
+curl -fsS "$BASE/api/key" | grep -q '"alg":"Ed25519"' \
+  || { echo "FAIL: signing key not served as Ed25519"; exit 1; }
 
 code=$(curl -fsS -X POST "$BASE/api/sessions" | grep -oE '"code":"[0-9]+"' | grep -oE '[0-9]+')
 echo "$code" | grep -Eq '^[0-9]{9}$' || { echo "FAIL: bad session code: '$code'"; exit 1; }
@@ -44,4 +44,4 @@ curl -fsS "$BASE/" | grep -q "CyberDoc" || { echo "FAIL: viewer page not served"
 curl -fsS "$BASE/api/audit" | grep -q '"verified":true' \
   || { echo "FAIL: audit chain did not verify"; exit 1; }
 
-echo "OK: key=ML-DSA-65, issued code=$code, viewer served, audit chain verified"
+echo "OK: key=Ed25519, issued code=$code, viewer served, audit chain verified"

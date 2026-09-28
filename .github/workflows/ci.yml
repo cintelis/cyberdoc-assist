@@ -15,7 +15,7 @@ concurrency:
 # Run every step under bash, on all three OSes, so the toolchain and native-tool
 # setup is written once. Third-party actions are avoided; actions/checkout is
 # first-party and pinned to a commit — this repo ships a security control, so its
-# supply chain stays small (same policy as sigilant).
+# supply chain stays small.
 defaults:
   run:
     shell: bash
@@ -26,9 +26,6 @@ env:
   # Debug info dominates a debug build; with the native stack it fills the runner
   # disk. Line tables keep backtraces useful without the bulk.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  # sigilant is a private git dependency; fetch it with git so the credential
-  # helper configured below applies (also set in .cargo/config.toml).
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   # Server side: the broker + shared crates, which deploy to Linux. The agent is
@@ -41,18 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # aws-lc-sys (via the sigilant crates) may assemble and generate bindings.
-      - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
-
-      - name: Authenticate to the private sigilant dependency
-        # Requires a repo/org secret SIGILANT_CI_TOKEN: a PAT (or GitHub App
-        # token) with read access to cintelis/sigilant. The default GITHUB_TOKEN
-        # cannot read another private repo.
-        run: |
-          git config --global \
-            url."https://x-access-token:${{ secrets.SIGILANT_CI_TOKEN }}@github.com/cintelis/sigilant".insteadOf \
-            "https://github.com/cintelis/sigilant"
+      # The broker + protocol are pure Rust (Ed25519, SHA-256, axum) — no native
+      # toolchain needed. The agent's OpenH264/WebRTC build is the matrix job below.
 
       - name: Install the pinned Rust toolchain
         run: |
@@ -93,12 +80,6 @@ jobs:
       - name: Install NASM (macOS)
         if: runner.os == 'macOS'
         run: brew install nasm
-
-      - name: Authenticate to the private sigilant dependency
-        run: |
-          git config --global \
-            url."https://x-access-token:${{ secrets.SIGILANT_CI_TOKEN }}@github.com/cintelis/sigilant".insteadOf \
-            "https://github.com/cintelis/sigilant"
 
       - name: Install the pinned Rust toolchain
         run: |

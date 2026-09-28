@@ -11,16 +11,12 @@ publish = false
 [workspace.dependencies]
 assist-proto = { path = "crates/assist-proto" }
 
-# Control plane, reused from Sigilant: ML-DSA signing keys for session grants,
-# and the hash chain for the session audit log. Pinned to a commit so a change
-# in Sigilant is adopted deliberately.
-#
-# For local development against an unpushed Sigilant checkout, uncomment:
-# [patch."https://github.com/cintelis/sigilant"]
-# sigilant-token = { path = "../sigilant/crates/sigilant-token" }
-# sigilant-audit = { path = "../sigilant/crates/sigilant-audit" }
-sigilant-token = { git = "https://github.com/cintelis/sigilant", rev = "f25c6c10b27476fe43f37870c9fbf060fecde775" }
-sigilant-audit = { git = "https://github.com/cintelis/sigilant", rev = "f25c6c10b27476fe43f37870c9fbf060fecde775" }
+# Self-contained: this workspace does not depend on any other CyberDoc platform.
+# Session grants are Ed25519-signed; the session audit log is a SHA-256 hash
+# chain — both implemented here (crates/assist-proto,
+# crates/assist-broker/src/audit.rs).
+ed25519-dalek = "2"
+sha2 = "0.10"
 
 anyhow = "1"
 base64ct = { version = "1.8", features = ["alloc"] }
@@ -35,9 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
 # Our own code needs no unsafe: the OS-facing work (capture, encode, input) is
-# done by crates that wrap it. Unlike Sigilant, the build graph *does* contain
-# classical crypto — WebRTC's DTLS-SRTP requires it — which is why this is a
-# separate workspace.
+# done by crates that wrap it.
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]

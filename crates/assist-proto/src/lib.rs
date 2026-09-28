@@ -5,12 +5,12 @@
 //! - [`Control`]: messages over the WebRTC data channel, peer to peer, between
 //!   the technician's browser and the agent.
 //! - [`Grant`]: what the broker allows a technician to do in one session,
-//!   signed with an ML-DSA key (via `sigilant-token`) so the agent can check it
-//!   without trusting the signaling path.
+//!   Ed25519-signed by the broker so the agent can check it without trusting
+//!   the signaling path.
 
 use base64ct::{Base64UrlUnpadded, Encoding};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sigilant_token::{SigningKey, VerifyingKey};
 
 /// Messages relayed by the broker. JSON, tagged by `type`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,9 +102,12 @@ pub struct Grant {
     pub expires_at: u64,
 }
 
-/// Domain separation: these signed bytes are an assist grant and nothing else,
-/// even though the key type is shared with Sigilant.
+/// Domain separation: these signed bytes are a CyberDoc Assist grant and
+/// nothing else, so a signature can never be replayed as another message type.
 const GRANT_DOMAIN: &[u8] = b"cyberdoc.assist.grant.v1\0";
+
+/// The signature scheme's `alg` label carried in [`PublicKey`].
+pub const GRANT_ALG: &str = "Ed25519";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrantError {
@@ -116,24 +119,20 @@ pub enum GrantError {
     WrongSession,
     #[error("grant has expired")]
     Expired,
-    #[error("signing failed: {0}")]
-    Signing(String),
 }
 
 fn signed_bytes(payload: &[u8]) -> Vec<u8> {
     [GRANT_DOMAIN, payload].concat()
 }
 
-/// `base64url(json) "." base64url(ML-DSA signature)`.
+/// `base64url(json) "." base64url(Ed25519 signature)`.
 pub fn sign_grant(grant: &Grant, key: &SigningKey) -> Result<String, GrantError> {
     let payload = serde_json::to_vec(grant).map_err(|_| GrantError::Malformed)?;
-    let signature = key
-        .sign(&signed_bytes(&payload))
-        .map_err(|e| GrantError::Signing(e.to_string()))?;
+    let signature: Signature = key.sign(&signed_bytes(&payload));
     Ok(format!(
         "{}.{}",
         Base64UrlUnpadded::encode_string(&payload),
-        Base64UrlUnpadded::encode_string(&signature)
+        Base64UrlUnpadded::encode_string(&signature.to_bytes())
     ))
 }
 
@@ -146,7 +145,9 @@ pub fn verify_grant(
 ) -> Result<Grant, GrantError> {
     let (payload, signature) = token.split_once('.').ok_or(GrantError::Malformed)?;
     let payload = Base64UrlUnpadded::decode_vec(payload).map_err(|_| GrantError::Malformed)?;
-    let signature = Base64UrlUnpadded::decode_vec(signature).map_err(|_| GrantError::Malformed)?;
+    let sig_bytes = Base64UrlUnpadded::decode_vec(signature).map_err(|_| GrantError::Malformed)?;
+    let sig_bytes: [u8; 64] = sig_bytes.try_into().map_err(|_| GrantError::Malformed)?;
+    let signature = Signature::from_bytes(&sig_bytes);
     key.verify(&signed_bytes(&payload), &signature)
         .map_err(|_| GrantError::BadSignature)?;
     let grant: Grant = serde_json::from_slice(&payload).map_err(|_| GrantError::Malformed)?;
@@ -162,24 +163,27 @@ pub fn verify_grant(
 /// The broker's public key as served at `GET /api/key`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicKey {
-    /// JOSE algorithm name, e.g. `ML-DSA-65`.
+    /// Signature algorithm label; always [`GRANT_ALG`].
     pub alg: String,
-    /// base64url public key bytes.
+    /// base64url of the 32-byte Ed25519 public key.
     pub key: String,
 }
 
 impl PublicKey {
     pub fn from_verifying_key(key: &VerifyingKey) -> Self {
         Self {
-            alg: key.algorithm().name().to_owned(),
-            key: Base64UrlUnpadded::encode_string(key.public_bytes()),
+            alg: GRANT_ALG.to_owned(),
+            key: Base64UrlUnpadded::encode_string(key.as_bytes()),
         }
     }
 
     pub fn to_verifying_key(&self) -> Option<VerifyingKey> {
-        let alg = sigilant_token::Algorithm::from_name(&self.alg)?;
+        if self.alg != GRANT_ALG {
+            return None;
+        }
         let bytes = Base64UrlUnpadded::decode_vec(&self.key).ok()?;
-        VerifyingKey::from_public_bytes(alg, &bytes).ok()
+        let bytes: [u8; 32] = bytes.try_into().ok()?;
+        VerifyingKey::from_bytes(&bytes).ok()
     }
 }
 
@@ -196,7 +200,11 @@ pub struct NewSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sigilant_token::Algorithm;
+
+    fn test_key() -> SigningKey {
+        // Deterministic key so tests need no RNG.
+        SigningKey::from_bytes(&[7u8; 32])
+    }
 
     fn grant(expires_at: u64) -> Grant {
         Grant {
@@ -211,29 +219,29 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let key = SigningKey::generate(Algorithm::MlDsa65).unwrap();
+        let key = test_key();
         let token = sign_grant(&grant(200), &key).unwrap();
-        let back = verify_grant(&token, key.verifying_key(), "123456789", 150).unwrap();
+        let back = verify_grant(&token, &key.verifying_key(), "123456789", 150).unwrap();
         assert_eq!(back, grant(200));
     }
 
     #[test]
     fn refuses_other_code_expiry_and_tampering() {
-        let key = SigningKey::generate(Algorithm::MlDsa65).unwrap();
+        let key = test_key();
         let token = sign_grant(&grant(200), &key).unwrap();
         let vk = key.verifying_key();
         assert!(matches!(
-            verify_grant(&token, vk, "999999999", 150),
+            verify_grant(&token, &vk, "999999999", 150),
             Err(GrantError::WrongSession)
         ));
         assert!(matches!(
-            verify_grant(&token, vk, "123456789", 200),
+            verify_grant(&token, &vk, "123456789", 200),
             Err(GrantError::Expired)
         ));
 
-        let other = SigningKey::generate(Algorithm::MlDsa65).unwrap();
+        let other = SigningKey::from_bytes(&[9u8; 32]);
         assert!(matches!(
-            verify_grant(&token, other.verifying_key(), "123456789", 150),
+            verify_grant(&token, &other.verifying_key(), "123456789", 150),
             Err(GrantError::BadSignature)
         ));
 
@@ -246,17 +254,18 @@ mod tests {
             token.split_once('.').unwrap().1
         );
         assert!(matches!(
-            verify_grant(&forged, vk, "123456789", 150),
+            verify_grant(&forged, &vk, "123456789", 150),
             Err(GrantError::BadSignature)
         ));
     }
 
     #[test]
     fn public_key_round_trip() {
-        let key = SigningKey::generate(Algorithm::MlDsa65).unwrap();
-        let wire = PublicKey::from_verifying_key(key.verifying_key());
+        let key = test_key();
+        let wire = PublicKey::from_verifying_key(&key.verifying_key());
+        assert_eq!(wire.alg, GRANT_ALG);
         let back = wire.to_verifying_key().unwrap();
-        assert_eq!(back.public_bytes(), key.verifying_key().public_bytes());
+        assert_eq!(back.as_bytes(), key.verifying_key().as_bytes());
     }
 
     #[test]

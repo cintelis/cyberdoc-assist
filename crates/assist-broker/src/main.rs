@@ -4,10 +4,10 @@
 //!    code, which the person reads to the technician.
 //! 2. Both sides open a WebSocket (`/ws/agent`, `/ws/viewer`) keyed by the code.
 //! 3. The viewer's WebRTC offer is relayed to the agent with a grant the broker
-//!    signed (ML-DSA, via `sigilant-token`): who the technician is and the most
-//!    they may do. The agent checks it, asks the person, and answers.
+//!    Ed25519-signed: who the technician is and the most they may do. The agent
+//!    checks it, asks the person, and answers.
 //! 4. Media and input then flow peer to peer; the broker only records what the
-//!    agent reports, in a hash-chained audit log (`sigilant-audit`).
+//!    agent reports, in a self-contained SHA-256 hash-chained audit log.
 //!
 //! The broker never sees the screen. In the hosted product this role can move
 //! to a Cloudflare Durable Object; this binary is the self-hosted variant and
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use assist_proto::{Grant, NewSession, PublicKey, Scope, Signal, sign_grant};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -30,11 +30,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
-use sigilant_token::{Algorithm, SigningKey, create_seed_file, signing_key_from_seed_file};
 use tokio::sync::mpsc;
 
 use crate::audit::AuditLog;
@@ -46,14 +46,11 @@ const VIEWER_HTML: &str = include_str!("../../../web/viewer.html");
 struct Args {
     #[arg(long, env = "ASSIST_LISTEN", default_value = "127.0.0.1:8787")]
     listen: SocketAddr,
-    /// ML-DSA-65 signing key seed; created on first run.
+    /// Ed25519 signing key seed (32-byte hex); created on first run.
     #[arg(long, env = "ASSIST_KEY_FILE", default_value = "broker-key.seed")]
     key_file: PathBuf,
     #[arg(long, env = "ASSIST_AUDIT_FILE", default_value = "audit.jsonl")]
     audit_file: PathBuf,
-    /// Names this broker in audit records.
-    #[arg(long, env = "ASSIST_BROKER_ID", default_value = "assist-broker")]
-    broker_id: String,
     /// How long a grant is valid, in seconds.
     #[arg(long, default_value_t = 3600)]
     grant_ttl: u64,
@@ -249,7 +246,7 @@ async fn create_session(State(state): State<Arc<AppState>>) -> Json<NewSession> 
 }
 
 async fn public_key(State(state): State<Arc<AppState>>) -> Json<PublicKey> {
-    Json(PublicKey::from_verifying_key(state.key.verifying_key()))
+    Json(PublicKey::from_verifying_key(&state.key.verifying_key()))
 }
 
 async fn audit_log(State(state): State<Arc<AppState>>) -> Response {
@@ -267,9 +264,9 @@ async fn audit_log(State(state): State<Arc<AppState>>) -> Response {
                 .collect();
             let chain = match verdict {
                 Ok(head) => {
-                    json!({ "verified": true, "head_seq": head.seq, "head_hash": sigilant_audit::chain::hex(&head.hash) })
+                    json!({ "verified": true, "head_seq": head.seq, "head_hash": crate::audit::hex(&head.hash) })
                 }
-                Err(e) => json!({ "verified": false, "error": e.to_string() }),
+                Err(e) => json!({ "verified": false, "error": e }),
             };
             Json(json!({ "chain": chain, "records": records })).into_response()
         }
@@ -401,15 +398,46 @@ async fn run_socket(
     writer.abort();
 }
 
+/// Loads the broker's Ed25519 signing key from a 32-byte hex seed file, or
+/// creates one (owner-only on Unix) on first run. A key overwritten is a key
+/// lost — and every grant it signed — so creation refuses to replace a file.
 fn load_or_create_key(path: &std::path::Path) -> Result<SigningKey> {
     if path.exists() {
-        signing_key_from_seed_file(path, Algorithm::MlDsa65)
-            .with_context(|| format!("loading {}", path.display()))
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("loading {}", path.display()))?;
+        let seed = decode_seed(text.trim())
+            .ok_or_else(|| anyhow!("{} is not a 32-byte hex seed", path.display()))?;
+        Ok(SigningKey::from_bytes(&seed))
     } else {
         tracing::info!("creating signing key {}", path.display());
-        create_seed_file(path, Algorithm::MlDsa65)
-            .with_context(|| format!("creating {}", path.display()))
+        let mut seed = [0u8; 32];
+        rand::rng().fill(&mut seed);
+        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        use std::io::Write;
+        file.write_all(hex.as_bytes())?;
+        Ok(SigningKey::from_bytes(&seed))
     }
+}
+
+fn decode_seed(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
+        *slot = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
 }
 
 #[tokio::main]
@@ -422,7 +450,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let key = load_or_create_key(&args.key_file)?;
-    let audit = AuditLog::open(&args.audit_file, &args.broker_id)?;
+    let audit = AuditLog::open(&args.audit_file)?;
     let state = Arc::new(AppState {
         sessions: Mutex::new(HashMap::new()),
         key,

@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-sigilant-token = { workspace = true }
+ed25519-dalek = { workspace = true }
 base64ct = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
